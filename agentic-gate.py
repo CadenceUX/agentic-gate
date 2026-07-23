@@ -30,7 +30,11 @@ Usage:
   agentic-gate.py status [session_id]          # print active state + how it's armed
   agentic-gate.py environments [query]         # list; exact name/'shared' shows full detail;
                                                 # anything else searches name/description/patterns
-  agentic-gate.py switch <env> [session_id]    # manually set the active environment
+  agentic-gate.py switch <env> [session_id] [--preview [PATH]]
+                                                # manually set the active environment;
+                                                # --preview also writes an HTML status
+                                                # page (env switched from/to, what's now
+                                                # loaded, where each piece lives on disk)
   agentic-gate.py classify <env|shared> [--skill P] [--agent P] [--command P]
                                         [--mcp P] [--path P] [--create "description"]
   agentic-gate.py audit [--roots DIR]          # find installed resources the manifest misses
@@ -46,9 +50,10 @@ import shlex
 import shutil
 import sys
 import time
+from html import escape
 from pathlib import Path
 
-VERSION = "0.2.4"
+VERSION = "0.2.5"
 
 
 # --------------------------------------------------------------------------
@@ -711,15 +716,248 @@ def environments_cmd(argv, quiet=False):
     return {"matches": matches}
 
 
+def _which(cmd: str):
+    return shutil.which(cmd)
+
+
+def _resolve_pattern_location(pattern: str, field: str):
+    """Best-effort answer to 'where does the thing behind this declared
+    pattern actually live on disk?' — the three kinds of skill source seen
+    in practice: hosted account skills (Customize → Skills, no local file),
+    plugin-cache skills/agents installed from a marketplace, and a
+    project's own .claude/skills/. Never authoritative — a glob is a glob —
+    but enough to point a developer at the right folder after a switch."""
+    if field == "mcp":
+        return {"kind": "mcp", "detail": "MCP server — connectivity comes "
+                "from Claude Code's MCP config, not a local skill file."}
+    if field == "paths":
+        return {"kind": "path", "detail": _norm(pattern)}
+    if field == "commands":
+        found = _which(pattern) if "*" not in pattern and "?" not in pattern else None
+        return ({"kind": "command", "detail": found} if found else
+                {"kind": "command", "detail": "not found on PATH right now "
+                 "(only resolvable for a literal command name, not a glob)"
+                 if ("*" in pattern or "?" in pattern) else "not found on PATH"})
+
+    # skills / agents: patterns are almost always "Prefix:*" style.
+    prefix = pattern.split(":", 1)[0] if ":" in pattern else pattern
+    if prefix == "anthropic-skills":
+        return {"kind": "hosted", "detail": "Claude.ai account skill "
+                "(installed via Customize → Skills) — no plugin-cache copy; "
+                "the desktop app syncs a per-session working copy under "
+                "~/Library/Application Support/Claude/local-agent-mode-"
+                "sessions/skills-plugin/*/*/skills/ when it's enabled."}
+
+    cache_root = Path.home() / ".claude" / "plugins" / "cache"
+    matches = sorted(cache_root.glob(f"*/{prefix}/*/{field}"))
+    if matches:
+        latest = matches[-1]
+        marketplace = latest.parent.parent.parent.name
+        return {"kind": "local-plugin",
+                "detail": f"{marketplace} marketplace → {latest}"}
+
+    project_skills = Path.cwd() / ".claude" / field
+    if project_skills.is_dir() and any(project_skills.iterdir()):
+        return {"kind": "project-local", "detail": str(project_skills)}
+
+    return {"kind": "unresolved",
+            "detail": f"no installed match found for '{pattern}' under "
+                      f"plugins/cache or {project_skills}"}
+
+
+def _hook_wiring():
+    """What's actually enforcing right now — plugin, standalone, both, or
+    none — and which hook events. Same signals `status` reports, reused
+    here so the preview page doesn't drift from what `status` would say."""
+    via_plugin = _armed_via_plugin()
+    try:
+        settings = _read_settings()
+    except SystemExit:
+        settings = {}
+    standalone_events = [e for e in HOOK_SPEC
+                         if _has_our_hook((settings.get("hooks") or {}).get(e))]
+    lines = []
+    if via_plugin:
+        lines.append(("plugin", "SessionStart, PreToolUse, PostToolUse "
+                                 "(bundled hooks.json)"))
+    if standalone_events:
+        lines.append(("standalone", f"{', '.join(standalone_events)} "
+                                     f"(registered in {settings_file()})"))
+    if not lines:
+        lines.append(("none", "no hooks currently registered — the "
+                               "guardrail is disarmed"))
+    return lines
+
+
+_ENV_PALETTE = ["#0e7490", "#a16207", "#7c3aed", "#be123c",
+                "#15803d", "#1d4ed8", "#c2410c", "#0f766e"]
+
+
+def _env_color(name):
+    if not name:
+        return "#71717a"
+    h = 0
+    for ch in name:
+        h = (h * 31 + ord(ch)) & 0xFFFFFFFF
+    return _ENV_PALETTE[h % len(_ENV_PALETTE)]
+
+
+def _env_dot(name):
+    label = escape(name) if name else "(none)"
+    return (f"<span class='envtag'><span class='dot' "
+            f"style='--dot:{_env_color(name)}'></span>{label}</span>")
+
+
+def _build_switch_preview_html(manifest, prev_state, new_env_name):
+    """Deterministic HTML fragment (no <html>/<head>/<body> — the Artifact
+    tool supplies that) for a status page after a manual environment
+    switch: what changed, what's now loaded for the new environment
+    (including the shared tier every environment gets silently), where
+    each declared item actually lives on disk, and which hooks are the
+    ones enforcing it. Generated by this script from the real manifest —
+    not something the calling model should hand-author or paraphrase."""
+    envs = manifest.get("environments") or {}
+    shared = manifest.get("shared") or {}
+    new_env = envs.get(new_env_name, {})
+    prev_env_name = prev_state.get("active")
+
+    def section_rows(bucket, fields=ENV_FIELDS):
+        rows = ""
+        for field in fields:
+            for pattern in (bucket.get(field) or []):
+                loc = _resolve_pattern_location(pattern, field)
+                kind_label = {"hosted": "hosted (account)",
+                              "local-plugin": "local plugin",
+                              "project-local": "project-local",
+                              "unresolved": "unresolved",
+                              "mcp": "MCP", "command": "command",
+                              "path": "path"}.get(loc["kind"], loc["kind"])
+                rows += (f"<tr><td class='mono'>{escape(field)}</td>"
+                         f"<td class='mono'>{escape(pattern)}</td>"
+                         f"<td><span class='kind kind-{loc['kind']}'>"
+                         f"{escape(kind_label)}</span></td>"
+                         f"<td class='mono muted'>{escape(str(loc['detail']))}</td></tr>")
+        return rows or ("<tr><td colspan='4' class='muted'>nothing declared"
+                        "</td></tr>")
+
+    hook_rows = "".join(
+        f"<tr><td><span class='kind kind-{k}'>{escape(k)}</span></td>"
+        f"<td>{escape(v)}</td></tr>" for k, v in _hook_wiring())
+
+    other_envs = ", ".join(sorted(n for n in envs if n != new_env_name)) or "(none)"
+
+    return f"""<style>
+.ag-wrap {{
+  --bg: #fbfbfa; --surface: #f1f3f4; --border: #dde1e3;
+  --text: #1c2024; --muted: #5b6470; --accent: #0e7490; --accent-tint: #e3f2f5;
+  font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  max-width: 900px; margin: 0 auto; color: var(--text);
+}}
+@media (prefers-color-scheme: dark) {{
+  .ag-wrap {{ --bg: #161819; --surface: #1f2225; --border: #33383d;
+    --text: #e8eaec; --muted: #9aa4ad; --accent: #22b8d8; --accent-tint: #123138; }}
+}}
+:root[data-theme="dark"] .ag-wrap {{ --bg: #161819; --surface: #1f2225; --border: #33383d;
+  --text: #e8eaec; --muted: #9aa4ad; --accent: #22b8d8; --accent-tint: #123138; }}
+:root[data-theme="light"] .ag-wrap {{ --bg: #fbfbfa; --surface: #f1f3f4; --border: #dde1e3;
+  --text: #1c2024; --muted: #5b6470; --accent: #0e7490; --accent-tint: #e3f2f5; }}
+.ag-wrap .mono {{ font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: .85em; }}
+.ag-wrap h1 {{ font-size: 1.3rem; margin: 0 0 .2rem; text-wrap: balance; }}
+.ag-wrap h2 {{ font-size: .78rem; margin: 1.6rem 0 .5rem; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--muted); font-weight: 600; }}
+.ag-wrap .muted {{ color: var(--muted); }}
+.ag-wrap .envtag {{ display: inline-flex; align-items: center; gap: .4rem; font-weight: 600; }}
+.ag-wrap .dot {{ display: inline-block; width: .55rem; height: .55rem; border-radius: 50%;
+  background: var(--dot); flex: none; }}
+.ag-wrap .banner {{ display: flex; align-items: center; gap: .6rem; flex-wrap: wrap;
+  padding: .8rem 1.1rem; border-radius: .6rem; background: var(--surface);
+  border: 1px solid var(--border); margin-bottom: 1.1rem; }}
+.ag-wrap .arrow {{ color: var(--muted); }}
+.ag-wrap table {{ width: 100%; border-collapse: collapse; font-size: .85rem; }}
+.ag-wrap th, .ag-wrap td {{ text-align: left; padding: .35rem .6rem;
+  border-bottom: 1px solid var(--border); }}
+.ag-wrap th {{ color: var(--muted); font-weight: 600; font-size: .72rem;
+  text-transform: uppercase; letter-spacing: .04em; }}
+.ag-wrap .kind {{ display: inline-block; padding: .1rem .5rem; border-radius: 999px;
+  font-size: .75rem; font-weight: 600; background: var(--accent-tint); color: var(--accent); }}
+.ag-wrap .table-scroll {{ overflow-x: auto; }}
+.ag-wrap .desc {{ margin: .2rem 0 .6rem; }}
+</style>
+<div class="ag-wrap">
+  <h1>Agentic-Gate — environment switch</h1>
+  <div class="banner">
+    {_env_dot(prev_env_name)}
+    <span class="arrow">→</span>
+    {_env_dot(new_env_name)}
+    <span class="muted">· switched {escape(time.strftime('%Y-%m-%d %H:%M:%S'))}</span>
+  </div>
+
+  <h2>Hooks enforcing this</h2>
+  <div class="table-scroll"><table>
+    <tr><th>Armed via</th><th>Events</th></tr>
+    {hook_rows}
+  </table></div>
+
+  <h2>Now active: {escape(new_env_name)}</h2>
+  <div class="desc muted">{escape(new_env.get('description', '(no description)'))}</div>
+  <div class="table-scroll"><table>
+    <tr><th>Field</th><th>Pattern</th><th>Location</th><th>Detail</th></tr>
+    {section_rows(new_env)}
+  </table></div>
+
+  <h2>Shared tier (available regardless of active environment)</h2>
+  <div class="desc muted">{escape(shared.get('description', '(no description)'))}</div>
+  <div class="table-scroll"><table>
+    <tr><th>Field</th><th>Pattern</th><th>Location</th><th>Detail</th></tr>
+    {section_rows(shared, fields=("commands", "mcp", "paths"))}
+  </table></div>
+
+  <h2>Switched out of</h2>
+  <div class="desc">{_env_dot(prev_env_name)}
+    <span class="muted">— {escape((envs.get(prev_env_name) or {}).get('description', 'no prior active environment this session') if prev_env_name else 'no prior active environment this session')}</span>
+  </div>
+
+  <h2>Other declared environments</h2>
+  <div class="muted">{escape(other_envs)}</div>
+</div>"""
+
+
 def switch_cmd(argv, quiet=False):
     """Manually set the active environment for a session — the third way an
     active environment changes, alongside SessionStart's project-home lookup
-    and PostToolUse's automatic switch-on-skill-run."""
+    and PostToolUse's automatic switch-on-skill-run. --preview additionally
+    writes an HTML status page (what changed, what's now loaded, where it
+    lives) for the caller to publish — e.g. Claude publishing it as an
+    Artifact — so a deliberate switch is visually confirmable, not just a
+    JSON state write."""
     if not argv:
         print("agentic-gate: switch requires an environment name "
-              "(usage: switch <env> [session_id])", file=sys.stderr)
+              "(usage: switch <env> [session_id] [--preview [PATH]])",
+              file=sys.stderr)
         return 2
-    env_name, session_id = argv[0], (argv[1] if len(argv) > 1 else "default")
+
+    positional, preview_requested, preview_path = [], False, None
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--preview":
+            preview_requested = True
+            if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                preview_path = argv[i + 1]
+                i += 2
+                continue
+            i += 1
+            continue
+        positional.append(tok)
+        i += 1
+
+    if not positional:
+        print("agentic-gate: switch requires an environment name "
+              "(usage: switch <env> [session_id] [--preview [PATH]])",
+              file=sys.stderr)
+        return 2
+    env_name = positional[0]
+    session_id = positional[1] if len(positional) > 1 else "default"
 
     manifest = load_manifest()
     if manifest is None:
@@ -733,13 +971,25 @@ def switch_cmd(argv, quiet=False):
               file=sys.stderr)
         return 2
 
-    state = load_state(session_id)
+    prev_state = dict(load_state(session_id))
+
+    state = dict(prev_state)
     state["active"] = env_name
     state["set_by"] = "manual switch"
     state["ts"] = time.time()
     save_state(session_id, state)
     if not quiet:
         print(f"active environment for session '{session_id}' → {env_name}")
+
+    if preview_requested:
+        html = _build_switch_preview_html(manifest, prev_state, env_name)
+        out_path = (Path(preview_path) if preview_path
+                   else conf_dir() / "switch-preview.html")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(html, encoding="utf-8")
+        if not quiet:
+            print(f"preview   → {out_path}")
+
     return 0
 
 
@@ -1040,6 +1290,36 @@ def selftest() -> int:
             check("switch refuses an unknown environment", rc == 2)
             check("switch leaves state untouched after a refusal",
                   load_state("t3").get("active") == "vendor-x")
+
+            # --- switch --preview: writes an HTML status page ---
+            rc = switch_cmd(["pack-a", "t3", "--preview"], quiet=True)
+            check("switch --preview succeeds", rc == 0)
+            preview_default = conf_dir() / "switch-preview.html"
+            check("switch --preview writes to the default path when none given",
+                  preview_default.exists())
+            preview_html = preview_default.read_text(encoding="utf-8")
+            check("switch --preview HTML shows the new active environment",
+                  "pack-a" in preview_html)
+            check("switch --preview HTML shows the environment switched out of",
+                  "vendor-x" in preview_html)
+            check("switch --preview HTML has no forbidden top-level tags",
+                  not any(tag in preview_html.lower() for tag in
+                          ("<!doctype", "<html", "<head", "<body")))
+
+            custom_preview = Path(td) / "custom-preview.html"
+            rc = switch_cmd(["vendor-x", "t3", "--preview", str(custom_preview)],
+                            quiet=True)
+            check("switch --preview PATH succeeds", rc == 0)
+            check("switch --preview PATH writes to the given path",
+                  custom_preview.exists())
+
+            check("_resolve_pattern_location flags anthropic-skills as hosted",
+                  _resolve_pattern_location("anthropic-skills:*", "skills")
+                  ["kind"] == "hosted")
+            check("_resolve_pattern_location falls back to unresolved for an "
+                  "unknown prefix",
+                  _resolve_pattern_location("TotallyMadeUpVendor:*", "skills")
+                  ["kind"] == "unresolved")
 
             # --- classify: add patterns to an existing environment ---
             rc = classify_cmd(["vendor-x", "--skill", "VendorX:new-tool"],

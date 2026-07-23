@@ -1,6 +1,6 @@
 {
   "name": "agentic-gate",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "No skill crosses environments unannounced — deterministic boundary enforcement between skill packs, plugins, and MCP servers sharing one session.",
   "author": {
     "name": "Darrin Southern, CadenceUX",

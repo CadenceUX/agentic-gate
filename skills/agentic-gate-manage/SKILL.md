@@ -155,6 +155,32 @@ different environment than the one `SessionStart`/`PostToolUse` set
 automatically, and wants to avoid warnings on every call in that stretch
 of work.
 
+**When the user wants to *see* what a switch changed, add `--preview`:**
+
+```bash
+python3 ~/.claude/agentic-gate/agentic-gate.py switch <env> "$CLAUDE_CODE_SESSION_ID" --preview
+```
+
+This writes a self-contained HTML status page (default
+`~/.claude/agentic-gate/switch-preview.html`; pass a path after `--preview`
+to choose a different one) showing: which hooks are actually enforcing
+right now, the environment switched from and to, the new environment's
+full declared surface plus the always-on shared tier, and a best-effort
+**location** for every declared skill/agent/command — a Claude.ai account
+skill (`anthropic-skills:*`, hosted, no local file), a local plugin skill
+(resolved marketplace + installed path), a project's own
+`.claude/skills/`, or unresolved. **Publish it as an Artifact** — the page
+is generated deterministically from the real manifest and real filesystem
+state by the script itself; don't hand-author or paraphrase a substitute
+status message in chat, same discipline as every other deterministic
+preview in this ecosystem. Use `--preview` when the user explicitly asks
+to see the switch, or after any switch where the location report would
+help them find where the resource they're about to touch actually lives —
+not on every switch by default, since the automatic SessionStart/
+PostToolUse switches deliberately stay silent (a preview per silent switch
+during ordinary work would be noise, not signal); this flag only exists on
+the manual `switch` verb.
+
 ```bash
 python3 ~/.claude/agentic-gate/agentic-gate.py classify <env> --skill "Pack:*"
 python3 ~/.claude/agentic-gate/agentic-gate.py classify <env> --agent "Pack:*" --command some-bin

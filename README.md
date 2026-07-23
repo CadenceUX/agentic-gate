@@ -61,7 +61,7 @@ From an interactive Claude Code session:
 Enable the plugin when prompted — enabling registers the hooks
 automatically. Your next session will report:
 
-> *Agentic-Gate v0.2.4 is installed but found no manifest … It is
+> *Agentic-Gate v0.2.5 is installed but found no manifest … It is
 > DISARMED for this session.*
 
 That's expected: the guardrail never guesses your boundaries. Ask Claude to
@@ -172,6 +172,7 @@ literal name.
 ```bash
 python3 ~/.claude/agentic-gate/agentic-gate.py switch vendor-x
 python3 ~/.claude/agentic-gate/agentic-gate.py switch vendor-x "$CLAUDE_CODE_SESSION_ID"
+python3 ~/.claude/agentic-gate/agentic-gate.py switch vendor-x "$CLAUDE_CODE_SESSION_ID" --preview
 ```
 
 `switch` manually sets the active environment for a session (defaults to
@@ -183,6 +184,20 @@ unknown environment names and lists the real ones instead of guessing.
 to target `status`/`switch` at the actual conversation you're in, rather
 than a made-up ID: `agentic-gate.py status "$CLAUDE_CODE_SESSION_ID"` shows
 this session's real active environment.
+
+Add **`--preview [PATH]`** to also write a self-contained HTML status page
+(default `~/.claude/agentic-gate/switch-preview.html`) — a visual answer to
+"what did that switch actually change?": the environment switched from and
+to, which hooks are actually enforcing right now, the new environment's
+full declared surface plus the always-on shared tier, and a best-effort
+**location** for every declared skill/agent/command — a Claude.ai account
+skill (`anthropic-skills:*`, no local file), an installed plugin skill
+(resolved marketplace + path under `~/.claude/plugins/cache/`), a
+project's own `.claude/skills/`, or unresolved. Hand the file to whatever
+can render it — in Claude Code, ask Claude to publish it as an Artifact.
+Only the manual `switch` verb generates this; the automatic
+SessionStart/PostToolUse switches stay silent, since a preview per silent
+switch during ordinary work would be constant noise, not a useful signal.
 
 ```bash
 python3 ~/.claude/agentic-gate/agentic-gate.py classify vendor-x --skill "VendorX:*"
