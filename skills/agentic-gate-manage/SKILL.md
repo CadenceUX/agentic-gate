@@ -133,35 +133,50 @@ python3 ~/.claude/agentic-gate/agentic-gate.py environments
 python3 ~/.claude/agentic-gate/agentic-gate.py environments <query>
 ```
 
-`environments` with no argument lists every declared environment. With a
-query, it searches by name/description/pattern text **and** by treating the
+`environments` with no argument lists every declared environment. A query
+that **exactly matches an environment name (or the literal `shared`)**
+shows its full declared contents — every pattern, not a count — use this
+when the user wants to *see* an environment, not search for one. Any other
+query searches by name/description/pattern text **and** by treating the
 query as a concrete identifier matched against each declared glob — use it
 to answer "which environment is X actually in?" (e.g. a specific agent
 name the user is asking about), not just "does anything mention X?".
 
 ```bash
-python3 ~/.claude/agentic-gate/agentic-gate.py switch <env> [session_id]
+python3 ~/.claude/agentic-gate/agentic-gate.py status "$CLAUDE_CODE_SESSION_ID"
+python3 ~/.claude/agentic-gate/agentic-gate.py switch <env> "$CLAUDE_CODE_SESSION_ID"
 ```
 
-Manually sets the active environment for a session. Use when the user is
-about to deliberately do work in a different environment than the one
-`SessionStart`/`PostToolUse` set automatically, and wants to avoid warnings
-on every call in that stretch of work. Session ID defaults to `default`,
-matching `status`'s own convention — if the user hasn't told you their real
-session ID, ask, or use `default` explicitly for a quick demonstration.
+`$CLAUDE_CODE_SESSION_ID` is set in every Claude Code session — use it to
+target the actual conversation you're in, rather than the `default`
+placeholder or a guessed ID. `switch` manually sets the active environment
+for a session. Use when the user is about to deliberately do work in a
+different environment than the one `SessionStart`/`PostToolUse` set
+automatically, and wants to avoid warnings on every call in that stretch
+of work.
 
 ```bash
 python3 ~/.claude/agentic-gate/agentic-gate.py classify <env> --skill "Pack:*"
 python3 ~/.claude/agentic-gate/agentic-gate.py classify <env> --agent "Pack:*" --command some-bin
 python3 ~/.claude/agentic-gate/agentic-gate.py classify new-env --create "Description" --skill "New:*"
+python3 ~/.claude/agentic-gate/agentic-gate.py classify shared --command a-shared-tool
 ```
 
 This is how `audit`'s UNASSIGNED findings get resolved: pick the right
 environment with the user (or create one with `--create` if it's a genuinely
-new toolset), then `classify` it in. Adding an already-present pattern is a
-safe no-op, not a duplicate. `classify` refuses an unknown environment name
-without `--create` — treat that refusal as a prompt to confirm the name
-with the user, not an error to work around.
+new toolset, or use the special target `shared` if it's a delivery utility
+every environment should use silently), then `classify` it in. Adding an
+already-present pattern is a safe no-op, not a duplicate. `classify`
+refuses an unknown environment name without `--create` — treat that
+refusal as a prompt to confirm the name with the user, not an error to
+work around. `shared` always "exists" implicitly, so `--create` doesn't
+apply to it.
+
+**A `"*"` entry in `projects`** sets a default/fallback environment for
+sessions outside every mapped project path (checked last, never overrides
+a real path match). Useful when the user wants "most sessions start
+trusting my own skills" without mapping every possible working directory —
+walk them through adding it the same way as any other `projects` entry.
 
 ## Explaining a warning or gate to the user
 

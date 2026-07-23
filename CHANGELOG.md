@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.2.3 — 2026-07-23
+
+Built for a real QA-isolation workflow: park a default "own skills" bubble for everyday work,
+switch into a vendor toolset to test it in isolation, with genuine warnings if either side
+reaches into the other.
+
+- **`classify` gains the special target `shared`** — `classify shared --command X` writes into
+  the manifest's shared tier instead of a named environment. `shared` always "exists" implicitly,
+  so `--create` doesn't apply to it and is rejected if passed.
+- **`environments <name>` shows full contents on an exact match.** Previously any query only
+  ever returned search hits ("matched on: name") — even a query that was itself a real
+  environment's name never showed what that environment actually contains. Now an exact match
+  against an environment name (or the literal `shared`) prints every declared skill/agent/
+  command/mcp/path pattern; anything else still searches as before.
+- **A `"*"` entry in `projects` is now a default/fallback environment** — checked last, only
+  when no specific project path matches, never overriding a real mapping. Lets a session outside
+  every explicitly-mapped project still start with a sensible default active environment instead
+  of none.
+- **Documented `$CLAUDE_CODE_SESSION_ID`** in the README and the bundled management skill — it's
+  set in every Claude Code session and lets `status`/`switch` target the actual conversation
+  you're in, not just a made-up ID or the `default` placeholder.
+- **Selftest**: 40 → 50 cases.
+
 ## v0.2.2 — 2026-07-23
 
 Documentation-only correction, released as a proper patch rather than amended in place — v0.2.1

@@ -20,15 +20,19 @@ Runs as three hooks (one script, branches on hook_event_name):
 
 Config: ~/.claude/agentic-gate/environments.json  (see environments.example.json)
 Override the config dir with $AGENTIC_GATE_HOME (used by selftest).
+A "*" entry in `projects` is a default/fallback environment for sessions
+outside every mapped project path — checked last, never shadows a real
+project match.
 
 Usage:
   echo '<hook-json>' | agentic-gate.py         # normal hook invocation
   agentic-gate.py install / uninstall [--purge]
   agentic-gate.py status [session_id]          # print active state + how it's armed
-  agentic-gate.py environments [query]         # list, or search name/description/patterns
+  agentic-gate.py environments [query]         # list; exact name/'shared' shows full detail;
+                                                # anything else searches name/description/patterns
   agentic-gate.py switch <env> [session_id]    # manually set the active environment
-  agentic-gate.py classify <env> [--skill P] [--agent P] [--command P]
-                                 [--mcp P] [--path P] [--create "description"]
+  agentic-gate.py classify <env|shared> [--skill P] [--agent P] [--command P]
+                                        [--mcp P] [--path P] [--create "description"]
   agentic-gate.py audit [--roots DIR]          # find installed resources the manifest misses
   agentic-gate.py selftest                     # run embedded fixture tests
 
@@ -44,7 +48,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 
 
 # --------------------------------------------------------------------------
@@ -248,11 +252,20 @@ def evaluate(manifest: dict, state: dict, tool: str, tool_input: dict):
 # Hook event handlers
 # --------------------------------------------------------------------------
 
+DEFAULT_PROJECT_KEY = "*"
+
+
 def home_env_for_cwd(manifest: dict, cwd: str):
-    for prefix, env in (manifest.get("projects") or {}).items():
+    """Specific project-path prefixes win first; a literal "*" entry in
+    `projects` is a fallback default for sessions outside every mapped
+    project, checked last so it never shadows a real match."""
+    projects = manifest.get("projects") or {}
+    for prefix, env in projects.items():
+        if prefix == DEFAULT_PROJECT_KEY:
+            continue
         if _norm(cwd).startswith(_norm(prefix)):
             return env
-    return None
+    return projects.get(DEFAULT_PROJECT_KEY)
 
 
 def handle_session_start(data: dict) -> dict:
@@ -588,6 +601,7 @@ def audit(argv, quiet=False):
 # --------------------------------------------------------------------------
 
 ENV_FIELDS = ("skills", "agents", "commands", "mcp", "paths")
+SHARED_TARGET = "shared"
 CLASSIFY_FLAGS = {"--skill": "skills", "--agent": "agents",
                    "--command": "commands", "--mcp": "mcp", "--path": "paths"}
 
@@ -596,6 +610,24 @@ def _env_summary_line(name: str, env: dict) -> str:
     counts = [f"{len(env.get(f) or [])} {f}" for f in ENV_FIELDS if env.get(f)]
     tail = f"  [{', '.join(counts)}]" if counts else ""
     return f"{name}: {env.get('description', '(no description)')}{tail}"
+
+
+def _env_detail_lines(name: str, env: dict):
+    """Full contents of one environment — every declared pattern, not just
+    counts. Used when a query exactly matches an environment (or 'shared')
+    by name, since at that point the user wants to *see* it, not search."""
+    lines = [f"{name}: {env.get('description', '(no description)')}"]
+    any_patterns = False
+    for field in ENV_FIELDS:
+        patterns = env.get(field) or []
+        if patterns:
+            any_patterns = True
+            lines.append(f"  {field}:")
+            for pattern in patterns:
+                lines.append(f"    {pattern}")
+    if not any_patterns:
+        lines.append("  (no patterns declared)")
+    return lines
 
 
 def _env_search_hits(query: str, name: str, env: dict):
@@ -639,16 +671,29 @@ def environments_cmd(argv, quiet=False):
         return {"environments": {}}
 
     envs = manifest.get("environments") or {}
+    shared = manifest.get("shared") or {}
     query = " ".join(argv).strip()
 
     if not query:
         if not quiet:
             for name, env in envs.items():
                 print(_env_summary_line(name, env))
-            shared = manifest.get("shared") or {}
             if shared:
                 print(_env_summary_line("(shared)", shared))
         return {"environments": sorted(envs)}
+
+    # Exact name match (including the special "shared" target) shows full
+    # contents — at that point the ask is "show me X", not "search for X".
+    if query == SHARED_TARGET and shared:
+        detail = _env_detail_lines("(shared)", shared)
+        if not quiet:
+            print("\n".join(detail))
+        return {"detail": {"(shared)": detail}}
+    if query in envs:
+        detail = _env_detail_lines(query, envs[query])
+        if not quiet:
+            print("\n".join(detail))
+        return {"detail": {query: detail}}
 
     matches = {name: hits for name, env in envs.items()
                if (hits := _env_search_hits(query, name, env))}
@@ -692,17 +737,21 @@ def switch_cmd(argv, quiet=False):
     return 0
 
 
+
 def classify_cmd(argv, quiet=False):
     """Add skill/agent/command/mcp/path patterns to an environment's
     declaration in the manifest — the write-side companion to `audit`
     (which finds what's unassigned) and `environments` (which finds what's
     already assigned where). Creates a new environment with --create when
-    it doesn't exist yet; refuses to silently redefine an existing one."""
+    it doesn't exist yet; refuses to silently redefine an existing one.
+    The special target name `shared` writes into the manifest's shared
+    tier instead of a named environment — it always 'exists' implicitly,
+    so --create/exists-checks don't apply to it."""
     if not argv:
-        print("agentic-gate: classify requires an environment name "
-              "(usage: classify <env> [--skill P] [--agent P] [--command P] "
-              "[--mcp P] [--path P] [--create \"description\"])",
-              file=sys.stderr)
+        print("agentic-gate: classify requires an environment name, or "
+              f"'{SHARED_TARGET}' for the shared tier (usage: classify "
+              "<env|shared> [--skill P] [--agent P] [--command P] [--mcp P] "
+              "[--path P] [--create \"description\"])", file=sys.stderr)
         return 2
     env_name, rest = argv[0], argv[1:]
 
@@ -735,28 +784,37 @@ def classify_cmd(argv, quiet=False):
               f"'install' first.", file=sys.stderr)
         return 2
 
-    envs = manifest.setdefault("environments", {})
     created = False
-    if env_name not in envs:
-        if create_desc is None:
-            print(f"agentic-gate: environment '{env_name}' does not exist. "
-                  f"Known: {', '.join(sorted(envs)) or '(none defined)'}. "
-                  f"Add --create \"description\" to create it.",
+    if env_name == SHARED_TARGET:
+        if create_desc is not None:
+            print("agentic-gate: --create doesn't apply to 'shared' — it "
+                  "always exists implicitly.", file=sys.stderr)
+            return 2
+        env = manifest.setdefault("shared", {})
+    else:
+        envs = manifest.setdefault("environments", {})
+        if env_name not in envs:
+            if create_desc is None:
+                print(f"agentic-gate: environment '{env_name}' does not "
+                      f"exist. Known: "
+                      f"{', '.join(sorted(envs)) or '(none defined)'}, or "
+                      f"'{SHARED_TARGET}'. Add --create \"description\" to "
+                      f"create a new one.", file=sys.stderr)
+                return 2
+            envs[env_name] = {"description": create_desc, "skills": [],
+                               "agents": [], "commands": [], "mcp": [],
+                               "paths": []}
+            created = True
+            if not quiet:
+                print(f"created environment '{env_name}': {create_desc}")
+        elif create_desc is not None:
+            print(f"agentic-gate: environment '{env_name}' already exists "
+                  f"— omit --create to add patterns to it, or edit its "
+                  f"description directly in {manifest_path()}.",
                   file=sys.stderr)
             return 2
-        envs[env_name] = {"description": create_desc, "skills": [],
-                           "agents": [], "commands": [], "mcp": [],
-                           "paths": []}
-        created = True
-        if not quiet:
-            print(f"created environment '{env_name}': {create_desc}")
-    elif create_desc is not None:
-        print(f"agentic-gate: environment '{env_name}' already exists — "
-              f"omit --create to add patterns to it, or edit its "
-              f"description directly in {manifest_path()}.", file=sys.stderr)
-        return 2
+        env = envs[env_name]
 
-    env = envs[env_name]
     added, skipped = [], []
     for field, patterns in additions.items():
         bucket = env.setdefault(field, [])
@@ -798,7 +856,7 @@ SELFTEST_MANIFEST = {
     "shared": {"commands": ["vx-clipboard-write", "vx-renderer"]},
     "policy": {"default": "warn", "unknown": "warn",
                "pairs": {"vendor-y|vendor-z": "gate"}},
-    "projects": {"/tmp/sgtest-project": "vendor-x"},
+    "projects": {"/tmp/sgtest-project": "vendor-x", "*": "pack-a"},
 }
 
 SELFTEST_CASES = [
@@ -864,6 +922,17 @@ def selftest() -> int:
                 "additionalContext", "")
             check("SessionStart resolves project home env",
                   "Active environment: vendor-x" in ctx)
+
+            check("home_env_for_cwd falls back to '*' when no project "
+                  "path matches",
+                  home_env_for_cwd(SELFTEST_MANIFEST,
+                                   "/nowhere/mapped") == "pack-a")
+            check("home_env_for_cwd prefers a real project match over '*'",
+                  home_env_for_cwd(SELFTEST_MANIFEST,
+                                   "/tmp/sgtest-project/sub") == "vendor-x")
+            no_default = {"projects": {"/tmp/sgtest-project": "vendor-x"}}
+            check("home_env_for_cwd returns None with no '*' and no match",
+                  home_env_for_cwd(no_default, "/nowhere/mapped") is None)
 
             save_state("t2", {"active": "vendor-x"})
             handle_post_tool_use(
@@ -937,9 +1006,16 @@ def selftest() -> int:
                   f"(got {search1b['matches']})")
 
             search2 = environments_cmd(["vendor-y"], quiet=True)
-            check("environments <query> matches by environment name",
-                  list(search2["matches"]) == ["vendor-y"],
-                  f"(got {search2['matches']})")
+            check("environments <exact-name> returns full detail, not "
+                  "just a search hit",
+                  "vendor-y" in search2.get("detail", {}),
+                  f"(got {search2})")
+
+            search2b = environments_cmd(["endor-y"], quiet=True)
+            check("environments <partial-name> (no exact match) still "
+                  "searches instead",
+                  list(search2b.get("matches", {})) == ["vendor-y"],
+                  f"(got {search2b})")
 
             search3 = environments_cmd(["no-such-thing-anywhere"], quiet=True)
             check("environments <query> with no hits returns no matches",
@@ -1000,6 +1076,42 @@ def selftest() -> int:
                               quiet=True)
             check("classify --create refuses to redefine an existing "
                   "environment", rc == 2)
+
+            # --- environments <exact-name> shows the real declared patterns ---
+            detail = environments_cmd(["vendor-x"], quiet=True)
+            det_lines = detail["detail"]["vendor-x"]
+            check("environments <exact-name> detail lists every declared "
+                  "field, not just counts",
+                  any("VendorX:*" in line for line in det_lines) and
+                  any("vx-build" in line for line in det_lines),
+                  f"(got {det_lines})")
+
+            # --- environments shared shows the shared tier's real contents ---
+            shared_detail = environments_cmd(["shared"], quiet=True)
+            check("environments shared shows the shared tier's patterns",
+                  any("vx-clipboard-write" in line
+                      for line in shared_detail["detail"]["(shared)"]),
+                  f"(got {shared_detail})")
+
+            # --- classify shared: writes to the shared tier, not an environment ---
+            rc = classify_cmd(["shared", "--command", "vx-new-shared-tool"],
+                              quiet=True)
+            check("classify shared succeeds", rc == 0)
+            reloaded2 = load_manifest()
+            check("classify shared persists to manifest['shared'], not "
+                  "manifest['environments']",
+                  "vx-new-shared-tool" in
+                  reloaded2["shared"].get("commands", []) and
+                  "shared" not in reloaded2["environments"])
+            check("classify shared's addition passes silently from any "
+                  "active environment on the next evaluation",
+                  evaluate(reloaded2, {"active": "pack-a"}, "Bash",
+                          {"command": "vx-new-shared-tool"}
+                          )["decision"] == "allow")
+
+            rc = classify_cmd(["shared", "--create", "nope"], quiet=True)
+            check("classify shared rejects --create (it always exists "
+                  "implicitly)", rc == 2)
 
             # --- status reports the real arming method (the live-test finding) ---
             check("_armed_via_plugin is false for a script run from a "

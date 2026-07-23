@@ -61,7 +61,7 @@ From an interactive Claude Code session:
 Enable the plugin when prompted — enabling registers the hooks
 automatically. Your next session will report:
 
-> *Agentic-Gate v0.2.2 is installed but found no manifest … It is
+> *Agentic-Gate v0.2.3 is installed but found no manifest … It is
 > DISARMED for this session.*
 
 That's expected: the guardrail never guesses your boundaries. Ask Claude to
@@ -99,7 +99,7 @@ python3 agentic-gate.py install
 `install` copies the engine to `~/.claude/agentic-gate/`, seeds the
 manifest if none exists (it never overwrites one), and registers the three
 hooks in user-scope `~/.claude/settings.json` — idempotently, with a backup
-of your settings written alongside. Verify with `selftest` (40/40 expected)
+of your settings written alongside. Verify with `selftest` (50/50 expected)
 and `status` (its `armed_via` field reports `plugin`, `standalone`, `both`,
 or `none` — checked independently of which method you actually used).
 
@@ -153,20 +153,25 @@ access silently. Exit code 1 when unassigned items exist (CI-friendly).
 ```bash
 python3 ~/.claude/agentic-gate/agentic-gate.py environments
 python3 ~/.claude/agentic-gate/agentic-gate.py environments vendor-x
+python3 ~/.claude/agentic-gate/agentic-gate.py environments shared
 python3 ~/.claude/agentic-gate/agentic-gate.py environments VendorX:schema-builder
 ```
 
 `environments` with no argument lists every environment (description, and
-how many skills/agents/commands/mcp/paths each declares). With a query, it
-searches two ways at once: plain substring match against names/descriptions/
-pattern *text*, and `fnmatch` of the query *as a concrete identifier*
-against each declared glob — so searching a real agent name answers "which
-environment would this exact call land in?" even when the manifest only
-ever wrote down a wildcard like `VendorX:*`, never that literal name.
+how many skills/agents/commands/mcp/paths each declares). A query that
+**exactly matches an environment's name** (or the literal `shared`) shows
+its *full* declared contents — every pattern, not just a count — since at
+that point you're asking to see it, not search for it. Any other query
+searches two ways at once: plain substring match against names/
+descriptions/pattern *text*, and `fnmatch` of the query *as a concrete
+identifier* against each declared glob — so searching a real agent name
+answers "which environment would this exact call land in?" even when the
+manifest only ever wrote down a wildcard like `VendorX:*`, never that
+literal name.
 
 ```bash
 python3 ~/.claude/agentic-gate/agentic-gate.py switch vendor-x
-python3 ~/.claude/agentic-gate/agentic-gate.py switch vendor-x my-session-id
+python3 ~/.claude/agentic-gate/agentic-gate.py switch vendor-x "$CLAUDE_CODE_SESSION_ID"
 ```
 
 `switch` manually sets the active environment for a session (defaults to
@@ -174,10 +179,15 @@ session `default`, matching `status`'s own convention) — a third way the
 active environment changes, alongside `SessionStart`'s project-home lookup
 and `PostToolUse`'s automatic switch when a skill actually runs. Refuses
 unknown environment names and lists the real ones instead of guessing.
+**`$CLAUDE_CODE_SESSION_ID` is set in every Claude Code session** — use it
+to target `status`/`switch` at the actual conversation you're in, rather
+than a made-up ID: `agentic-gate.py status "$CLAUDE_CODE_SESSION_ID"` shows
+this session's real active environment.
 
 ```bash
 python3 ~/.claude/agentic-gate/agentic-gate.py classify vendor-x --skill "VendorX:*"
 python3 ~/.claude/agentic-gate/agentic-gate.py classify new-vendor --create "A new toolset" --skill "NewVendor:*"
+python3 ~/.claude/agentic-gate/agentic-gate.py classify shared --command a-tool-everyone-may-use
 ```
 
 `classify` adds skill/agent/command/mcp/path patterns to an environment's
@@ -185,8 +195,11 @@ declaration — the write-side companion to `audit` (finds what's
 *unassigned*) and `environments` (finds what's already assigned *where*).
 Add `--create "description"` to define a brand-new environment in the same
 call; without it, `classify` refuses an unknown environment name rather
-than silently creating a typo. Adding a pattern that's already present is a
-no-op, not a duplicate. The manifest is backed up before every write, same
+than silently creating a typo. The special target name **`shared`** writes
+into the shared tier instead of a named environment — it always "exists"
+implicitly, so `--create` doesn't apply to it. Adding a pattern that's
+already present is a no-op, not a duplicate. The manifest is backed up
+before every write, same
 discipline as `install`'s settings.json backup.
 
 ## The manifest
@@ -205,7 +218,7 @@ discipline as `install`'s settings.json backup.
   "shared":   { "commands": ["a-delivery-tool-everyone-may-use"] },
   "policy":   { "default": "warn", "unknown": "warn",
                 "pairs": { "vendor-x|vendor-y": "gate" } },
-  "projects": { "/path/to/some/project": "vendor-x" }
+  "projects": { "/path/to/some/project": "vendor-x", "*": "my-pack" }
 }
 ```
 
@@ -216,9 +229,11 @@ discipline as `install`'s settings.json backup.
 | `environments.<name>.commands` | Bare command basenames (`Bash` calls). |
 | `environments.<name>.mcp` | MCP tool-name globs (`mcp__server__tool`). |
 | `environments.<name>.paths` | File globs (`Read`/`Write`/`Edit`, and paths inside `Bash` commands). |
-| `shared` | Same shape — resources every environment may use, silently. |
+| `shared` | Same shape — resources every environment may use, silently. Write to it with `classify shared ...` rather than editing this block by hand. |
 | `policy.default` | `warn` \| `gate` \| `deny` for cross-environment calls. |
 | `policy.unknown` | What happens when a skill/agent/MCP tool matches *no* environment — your protection when a new toolset is installed and not yet classified. |
+| `projects.<path>` | Project path prefix → home environment, checked first, most specific wins (first prefix match in declaration order). |
+| `projects.*` | Optional default/fallback environment for sessions outside every mapped project — checked last, never overrides a real path match. Omit it and unmapped sessions simply start with no active environment (set by the first skill that runs instead). |
 | `policy.pairs` | Per-boundary overrides, e.g. `"a\|b": "gate"`. Unordered. |
 | `projects` | Map of project path prefixes → home environment at session start. |
 
