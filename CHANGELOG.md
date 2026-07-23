@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.2.7 — 2026-07-23
+
+Prompted by a real incident: a `switch` call made during this session omitted the session id
+and silently wrote state to a bucket literally named `'default'` — no error, no warning, looked
+exactly like it had worked. Two things followed from digging into that: `switch` needed to
+refuse that shape of call outright, and there was no way to see which classified skill/plugin
+was actually installed, at what version, or whether GitHub had something newer.
+
+- **`switch <env> <session_id>` now requires a real session id.** A bare `switch <env>` or an
+  explicit `switch <env> default` exits 2 with an error pointing at `$CLAUDE_CODE_SESSION_ID`,
+  instead of silently falling through to the shared `'default'` bucket that no real session ever
+  reads. `--allow-default` overrides for the rare deliberate case. `status` is unchanged — a
+  `default`-bucket *read* is harmless; only the *write* path in `switch` was the actual risk.
+- **`audit --check-updates`** — a new, deliberately on-demand flag (never automatic, never part
+  of `switch`, since it makes real network calls and `switch` must stay instant and offline).
+  Resolves every already-classified skill/agent/command pattern to its installed version (via
+  Claude Code's own `installed_plugins.json` — no network needed for "what's installed"), and
+  for GitHub-sourced marketplaces, checks the latest release via the GitHub REST API
+  (unauthenticated, 60 req/hr, one lookup cached per repo per run). Writes a full per-environment
+  report to `inventory.json` — pattern, resolved location, installed/latest version, marketplace,
+  update channel, GitHub link, and an `up-to-date` / `outdated` / `no-update-channel` / `unknown`
+  / `n/a` status — plus a condensed stdout summary. A locally-distributed vendor marketplace
+  (no GitHub repo to check) correctly reports `no-update-channel` rather than erroring or
+  silently omitting the resource.
+- **`switch --preview`'s "Now active" section leads with the same Environment/Description/
+  Declares summary table** as "Switched out of" and "Other declared environments" — previously
+  it was just a plain description line, the odd one out of the three. The detailed field/
+  pattern/location table for the new environment's full surface stays underneath, unchanged.
+- Selftest: 60 → 87 cases (session-id refusal/`--allow-default`, `_version_status`,
+  `_plugin_root_from`, `_enrich_with_version` across github/directory/non-plugin kinds,
+  graceful degradation when `installed_plugins.json`/`known_marketplaces.json` are missing, an
+  end-to-end `audit --check-updates` run against a fake plugin cache and sandboxed home dir — no
+  real network calls in the suite itself — and the "Now active" table-format check).
+
 ## v0.2.6 — 2026-07-23
 
 Follow-up to v0.2.5's `switch --preview`, refining the page after actually looking at it —

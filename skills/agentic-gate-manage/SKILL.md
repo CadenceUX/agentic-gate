@@ -123,6 +123,43 @@ by hand-editing `environments.json`. Note the scan is filesystem-based and
 best-effort: MCP servers and non-plugin skill packs may need manual entries
 via `classify`.
 
+## Audit --check-updates — installed versions and freshness
+
+```bash
+python3 ~/.claude/agentic-gate/agentic-gate.py audit --check-updates
+```
+
+A separate, **on-demand** flag on `audit` — deliberately not something
+`switch` does automatically, because it makes real network calls (GitHub
+API lookups) and `switch` must stay instant and offline. Run it
+occasionally, or when the user specifically asks "what versions am I
+running" / "is anything out of date" — never as a side effect of an
+ordinary switch.
+
+For every *already-classified* skill/agent/command pattern across every
+environment (plus `shared`), it resolves the installed version (from
+Claude Code's own `installed_plugins.json` — no network needed for "what's
+installed") and, for plugins whose marketplace is GitHub-sourced, checks
+the latest release via the GitHub REST API. The full result is written to
+`~/.claude/agentic-gate/inventory.json` (per environment: pattern, kind,
+resolved location, installed version, marketplace, update channel, latest
+version, github repo link, and a `status` of `up-to-date` / `outdated` /
+`no-update-channel` / `unknown` / `n/a`), plus a condensed human-readable
+summary on stdout.
+
+**`no-update-channel` is an expected, normal result, not an error** — a
+plugin distributed via a local/vendor directory marketplace (rather than a
+public GitHub repo) simply has no upstream to check against. Explain it to
+the user as "this vendor ships updates through their own channel, not
+GitHub — there's nothing to compare against here," not as something
+broken. Likewise `n/a` just means that resource (a hosted Claude.ai
+account skill, an MCP server, a bare path) was never installed by a
+plugin marketplace in the first place — there is no version to track.
+
+Unauthenticated GitHub REST is rate-limited to 60 requests/hour; the
+engine caches one lookup per repo within a single run, but don't run
+`--check-updates` in a tight loop.
+
 ## Environments, switch, and classify
 
 Three verbs cover discovery, session control, and manifest edits — the loop
@@ -147,13 +184,23 @@ python3 ~/.claude/agentic-gate/agentic-gate.py status "$CLAUDE_CODE_SESSION_ID"
 python3 ~/.claude/agentic-gate/agentic-gate.py switch <env> "$CLAUDE_CODE_SESSION_ID"
 ```
 
-`$CLAUDE_CODE_SESSION_ID` is set in every Claude Code session — use it to
-target the actual conversation you're in, rather than the `default`
-placeholder or a guessed ID. `switch` manually sets the active environment
-for a session. Use when the user is about to deliberately do work in a
-different environment than the one `SessionStart`/`PostToolUse` set
-automatically, and wants to avoid warnings on every call in that stretch
-of work.
+`$CLAUDE_CODE_SESSION_ID` is set in every Claude Code session — **always
+pass it**, quoted, as `switch`'s second argument. `switch` manually sets
+the active environment for a session. Use when the user is about to
+deliberately do work in a different environment than the one
+`SessionStart`/`PostToolUse` set automatically, and wants to avoid
+warnings on every call in that stretch of work.
+
+**`switch` refuses to run without a real session id.** A bare `switch
+<env>` — or an explicit `switch <env> default` — exits non-zero with an
+error pointing at `$CLAUDE_CODE_SESSION_ID`, rather than silently writing
+state to a session literally named `'default'` that no real conversation
+ever reads. That used to be the failure mode: a missing argument looked
+like it worked (exit 0, a printed confirmation) while actually targeting
+nothing. Treat the refusal as a prompt to go find/pass the real session
+id, not an error to route around. If you genuinely need the shared
+`default` bucket on purpose (e.g. a one-off manual test from a terminal
+with no session), pass `--allow-default` explicitly.
 
 **When the user wants to *see* what a switch changed, add `--preview`:**
 

@@ -30,14 +30,23 @@ Usage:
   agentic-gate.py status [session_id]          # print active state + how it's armed
   agentic-gate.py environments [query]         # list; exact name/'shared' shows full detail;
                                                 # anything else searches name/description/patterns
-  agentic-gate.py switch <env> [session_id] [--preview [PATH]]
+  agentic-gate.py switch <env> <session_id> [--allow-default] [--preview [PATH]]
                                                 # manually set the active environment;
-                                                # --preview also writes an HTML status
-                                                # page (env switched from/to, what's now
-                                                # loaded, where each piece lives on disk)
+                                                # session_id is required — pass
+                                                # $CLAUDE_CODE_SESSION_ID, or refuses
+                                                # (--allow-default overrides); --preview
+                                                # also writes an HTML status page (env
+                                                # switched from/to, what's now loaded,
+                                                # where each piece lives on disk)
   agentic-gate.py classify <env|shared> [--skill P] [--agent P] [--command P]
                                         [--mcp P] [--path P] [--create "description"]
-  agentic-gate.py audit [--roots DIR]          # find installed resources the manifest misses
+  agentic-gate.py audit [--roots DIR] [--check-updates]
+                                                # find installed resources the manifest
+                                                # misses; --check-updates also resolves
+                                                # each classified resource's installed
+                                                # version and checks GitHub for newer
+                                                # releases, writing a full report to
+                                                # inventory.json
   agentic-gate.py selftest                     # run embedded fixture tests
 
 MIT License — Darrin Southern, CadenceUX, 2026.
@@ -46,6 +55,7 @@ MIT License — Darrin Southern, CadenceUX, 2026.
 import fnmatch
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -53,7 +63,7 @@ import time
 from html import escape
 from pathlib import Path
 
-VERSION = "0.2.6"
+VERSION = "0.2.7"
 
 
 # --------------------------------------------------------------------------
@@ -554,12 +564,18 @@ def uninstall(argv, quiet=False):
 def audit(argv, quiet=False):
     """Enumerate installed plugin resources and report anything the manifest
     does not classify. Best-effort filesystem scan — MCP servers and
-    non-plugin skill packs may need manual classification."""
+    non-plugin skill packs may need manual classification. --check-updates
+    additionally resolves every *classified* resource's installed version
+    and checks GitHub for newer releases, writing a full report to
+    inventory.json — deliberately a separate, on-demand flag rather than
+    something switch does automatically, since it makes network calls and
+    switch must stay instant and offline."""
     roots = []
     if "--roots" in argv:
         roots = [Path(argv[argv.index("--roots") + 1])]
     else:
         roots = [Path.home() / ".claude" / "plugins" / "cache"]
+    check_updates = "--check-updates" in argv
 
     manifest = load_manifest() or {}
     envs = manifest.get("environments") or {}
@@ -604,7 +620,27 @@ def audit(argv, quiet=False):
         if unassigned:
             print("\nAdd the unassigned items to an environment (or the "
                   "shared tier) in", manifest_path())
-    return {"classified": classified, "unassigned": unassigned}
+
+    result = {"classified": classified, "unassigned": unassigned}
+    if check_updates:
+        inventory = _build_inventory(manifest, check_updates=True)
+        out_path = conf_dir() / "inventory.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(inventory, indent=2), encoding="utf-8")
+        result["inventory"] = inventory
+        if not quiet:
+            print(f"\nversion report → {out_path}")
+            for env_name, env_data in inventory["environments"].items():
+                print(f"  {env_name}:")
+                for r in env_data["resources"]:
+                    if r["update_channel"] == "n/a":
+                        continue
+                    installed = r["installed_version"] or "?"
+                    latest = r["latest_version"] or "?"
+                    print(f"    {r['field']:8} {r['pattern']:28} "
+                          f"installed={installed:10} latest={latest:10} "
+                          f"{r['status']}")
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -765,6 +801,204 @@ def _resolve_pattern_location(pattern: str, field: str):
                       f"plugins/cache or {project_skills}"}
 
 
+def _plugin_root_from(path: Path):
+    """Walk up from any file/dir under ~/.claude/plugins/cache to the
+    <version> directory — the exact 'installPath' installed_plugins.json
+    records — e.g. .../cache/fmaiac/FileMaker/0.8.16/bin/fm-build or
+    .../cache/fmaiac/FileMaker/0.8.16/skills both resolve to
+    .../cache/fmaiac/FileMaker/0.8.16. Returns None if path isn't under
+    the plugin cache at all."""
+    cache_root = Path.home() / ".claude" / "plugins" / "cache"
+    try:
+        rel = path.resolve().relative_to(cache_root.resolve())
+    except (OSError, ValueError):
+        return None
+    if len(rel.parts) < 3:
+        return None
+    return cache_root / rel.parts[0] / rel.parts[1] / rel.parts[2]
+
+
+def _installed_plugins_index():
+    """installPath (str) -> {plugin, marketplace, version, gitCommitSha}
+    for every installed plugin, read from Claude Code's own
+    installed_plugins.json. Best-effort: returns {} on any read/parse
+    failure — this is enrichment data for `audit --check-updates`, never
+    something we write, so a bad read degrades gracefully rather than
+    blocking the command that asked for it."""
+    p = Path.home() / ".claude" / "plugins" / "installed_plugins.json"
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    index = {}
+    for key, entries in (data.get("plugins") or {}).items():
+        plugin, _, marketplace = key.partition("@")
+        for entry in entries:
+            install_path = entry.get("installPath")
+            if install_path:
+                index[install_path] = {
+                    "plugin": plugin, "marketplace": marketplace,
+                    "version": entry.get("version"),
+                    "gitCommitSha": entry.get("gitCommitSha")}
+    return index
+
+
+def _known_marketplaces():
+    """marketplace name -> its 'source' dict ({"source": "github", "repo":
+    "OWNER/REPO"} or {"source": "directory", "path": ...} etc), read from
+    Claude Code's known_marketplaces.json. Same best-effort contract as
+    _installed_plugins_index — a vendor's plugin distributed via a local
+    directory simply has no upstream repo to check, and that is an
+    expected, reportable state, not an error."""
+    p = Path.home() / ".claude" / "plugins" / "known_marketplaces.json"
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {name: (info.get("source") or {}) for name, info in data.items()}
+
+
+_VERSION_RE = re.compile(r"(\d+(?:\.\d+)+)")
+
+
+def _version_status(installed: str, latest: str) -> str:
+    """Best-effort comparison of an installed version against a latest
+    release/tag string. Extracts the first dotted-number run from each
+    (handles a bare '0.2.6' and a prefixed tag like 'agentic-gate--v0.2.6'
+    alike) and compares as tuples of ints. 'unknown' when either side has
+    nothing version-shaped in it — not every tag is semver."""
+    def extract(v):
+        m = _VERSION_RE.search(v or "")
+        return tuple(int(p) for p in m.group(1).split(".")) if m else None
+    a, b = extract(installed), extract(latest)
+    if a is None or b is None:
+        return "unknown"
+    return "up-to-date" if a >= b else "outdated"
+
+
+def _latest_github_release(owner_repo: str, cache: dict):
+    """Latest release (or, lacking any releases, latest tag) for a
+    GitHub-sourced marketplace repo, via the public REST API. Network
+    call — only ever invoked from `audit --check-updates`, never from
+    switch or any other hot path. Caches per owner/repo within a single
+    run (a marketplace's plugins usually share one repo — no reason to
+    hit the API twice for the same lookup, and unauthenticated GitHub REST
+    is rate-limited to 60 req/hr). Degrades to None on any failure
+    (offline, rate-limited, repo not found, no releases and no tags)
+    rather than raising — one bad lookup must not fail the whole report."""
+    if owner_repo in cache:
+        return cache[owner_repo]
+    import urllib.error
+    import urllib.request
+    headers = {"Accept": "application/vnd.github+json",
+               "User-Agent": "agentic-gate"}
+    result = None
+    for path, is_list in (("releases/latest", False), ("tags", True)):
+        url = f"https://api.github.com/repos/{owner_repo}/{path}"
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, urllib.error.HTTPError,
+                TimeoutError, json.JSONDecodeError, OSError, ValueError):
+            continue
+        if not is_list and isinstance(data, dict) and data.get("tag_name"):
+            result = {"tag": data["tag_name"], "url": data.get("html_url")}
+            break
+        if is_list and isinstance(data, list) and data:
+            name = data[0].get("name")
+            result = {"tag": name,
+                      "url": f"https://github.com/{owner_repo}/releases/tag/{name}"}
+            break
+    cache[owner_repo] = result
+    return result
+
+
+def _enrich_with_version(loc: dict, check_updates: bool, gh_cache: dict,
+                          installed_index: dict, marketplaces: dict) -> dict:
+    """Adds installed_version / marketplace / update_channel / github_repo
+    / latest_version / status to a location dict already produced by
+    _resolve_pattern_location — the same resolver `switch --preview` uses,
+    so this never drifts from what the preview page reports. Only the
+    'local-plugin' kind (skills/agents) and a PATH-resolved 'command' that
+    happens to live under the plugin cache have an actual installed
+    artifact to version; everything else (hosted, mcp, path, project-local,
+    unresolved) gets update_channel: 'n/a' since there is nothing a
+    marketplace installed for us to check."""
+    out = dict(loc, installed_version=None, marketplace=None,
+               update_channel="n/a", github_repo=None,
+               latest_version=None, status="n/a")
+
+    plugin_root = None
+    if loc["kind"] == "local-plugin":
+        detail_path = loc["detail"].split("→", 1)[-1].strip()
+        plugin_root = _plugin_root_from(Path(detail_path))
+    elif loc["kind"] == "command" and loc["detail"] and Path(loc["detail"]).exists():
+        plugin_root = _plugin_root_from(Path(loc["detail"]))
+    if plugin_root is None:
+        return out
+
+    info = installed_index.get(str(plugin_root))
+    if not info:
+        return out
+    out["installed_version"] = info["version"]
+    out["marketplace"] = info["marketplace"]
+
+    source = marketplaces.get(info["marketplace"], {})
+    if source.get("source") == "github" and source.get("repo"):
+        out["update_channel"] = "github"
+        out["github_repo"] = source["repo"]
+        if check_updates:
+            release = _latest_github_release(source["repo"], gh_cache)
+            if release:
+                out["latest_version"] = release["tag"]
+                out["status"] = _version_status(info["version"], release["tag"])
+            else:
+                out["status"] = "unknown"
+        else:
+            out["status"] = "unknown"
+    elif source.get("source"):
+        out["update_channel"] = source["source"]
+        out["status"] = "no-update-channel"
+    return out
+
+
+def _build_inventory(manifest, check_updates):
+    """Resolve every declared pattern (across every environment + shared)
+    to installed-version / update-freshness info, for `audit
+    --check-updates`. Reuses _resolve_pattern_location and ENV_FIELDS —
+    the same resolution `switch --preview` already does — plus the new
+    version-enrichment helpers above. Network calls (GitHub release
+    lookups) only happen when check_updates is True, and are cached
+    per-repo within this single call via gh_cache."""
+    envs = manifest.get("environments") or {}
+    shared = manifest.get("shared") or {}
+    installed_index = _installed_plugins_index()
+    marketplaces = _known_marketplaces()
+    gh_cache = {}
+
+    def build_bucket(bucket):
+        resources = []
+        for field in ENV_FIELDS:
+            for pattern in (bucket.get(field) or []):
+                loc = _resolve_pattern_location(pattern, field)
+                enriched = _enrich_with_version(
+                    loc, check_updates, gh_cache, installed_index, marketplaces)
+                resources.append({"field": field, "pattern": pattern, **enriched})
+        return resources
+
+    report = {"generated": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+              "check_updates": check_updates,
+              "environments": {}, "shared": {}}
+    for name, bucket in envs.items():
+        report["environments"][name] = {
+            "description": bucket.get("description", ""),
+            "resources": build_bucket(bucket)}
+    report["shared"] = {"description": shared.get("description", ""),
+                         "resources": build_bucket(shared)}
+    return report
+
+
 def _hook_wiring():
     """What's actually enforcing right now — plugin, standalone, both, or
     none — and which hook events. Same signals `status` reports, reused
@@ -849,6 +1083,10 @@ def _build_switch_preview_html(manifest, prev_state, new_env_name):
                   if bucket.get(f)]
         return ", ".join(counts) or "nothing declared"
 
+    new_env_row = (f"<tr><td>{_env_dot(new_env_name)}</td>"
+                   f"<td class='muted'>{escape(new_env.get('description', '(no description)'))}</td>"
+                   f"<td class='mono muted'>{escape(_field_counts(new_env))}</td></tr>")
+
     other_env_rows = "".join(
         f"<tr><td>{_env_dot(name)}</td>"
         f"<td class='muted'>{escape(env.get('description', '(no description)'))}</td>"
@@ -918,7 +1156,10 @@ def _build_switch_preview_html(manifest, prev_state, new_env_name):
   </table></div>
 
   <h2>Now active: {escape(new_env_name)}</h2>
-  <div class="desc muted">{escape(new_env.get('description', '(no description)'))}</div>
+  <div class="table-scroll"><table>
+    <tr><th>Environment</th><th>Description</th><th>Declares</th></tr>
+    {new_env_row}
+  </table></div>
   <div class="table-scroll"><table>
     <tr><th>Field</th><th>Pattern</th><th>Location</th><th>Detail</th></tr>
     {section_rows(new_env)}
@@ -952,14 +1193,20 @@ def switch_cmd(argv, quiet=False):
     writes an HTML status page (what changed, what's now loaded, where it
     lives) for the caller to publish — e.g. Claude publishing it as an
     Artifact — so a deliberate switch is visually confirmable, not just a
-    JSON state write."""
+    JSON state write.
+
+    A real session id is required: a bare `switch <env>` with nothing else
+    used to fall back to a literal 'default' bucket, silently writing state
+    for no actual conversation while looking like it worked. That's refused
+    now unless --allow-default is passed explicitly — always prefer passing
+    $CLAUDE_CODE_SESSION_ID, which every Claude Code session sets."""
     if not argv:
         print("agentic-gate: switch requires an environment name "
-              "(usage: switch <env> [session_id] [--preview [PATH]])",
-              file=sys.stderr)
+              "(usage: switch <env> <session_id> [--allow-default] "
+              "[--preview [PATH]])", file=sys.stderr)
         return 2
 
-    positional, preview_requested, preview_path = [], False, None
+    positional, preview_requested, preview_path, allow_default = [], False, None, False
     i = 0
     while i < len(argv):
         tok = argv[i]
@@ -971,16 +1218,29 @@ def switch_cmd(argv, quiet=False):
                 continue
             i += 1
             continue
+        if tok == "--allow-default":
+            allow_default = True
+            i += 1
+            continue
         positional.append(tok)
         i += 1
 
     if not positional:
         print("agentic-gate: switch requires an environment name "
-              "(usage: switch <env> [session_id] [--preview [PATH]])",
-              file=sys.stderr)
+              "(usage: switch <env> <session_id> [--allow-default] "
+              "[--preview [PATH]])", file=sys.stderr)
         return 2
     env_name = positional[0]
     session_id = positional[1] if len(positional) > 1 else "default"
+
+    if session_id == "default" and not allow_default:
+        print("agentic-gate: switch requires a real session id — pass "
+              '"$CLAUDE_CODE_SESSION_ID" (set in every Claude Code session) '
+              "so this actually targets your conversation. Refusing to "
+              "write to the shared 'default' bucket, which no real session "
+              "reads. Pass --allow-default to do this on purpose.",
+              file=sys.stderr)
+        return 2
 
     manifest = load_manifest()
     if manifest is None:
@@ -1266,6 +1526,146 @@ def selftest() -> int:
                   len(report["unassigned"]) == 3,
                   f"(got {report['unassigned']})")
 
+            # --- audit --check-updates: version status, pure logic ---
+            check("_version_status: equal versions are up-to-date",
+                  _version_status("0.2.6", "0.2.6") == "up-to-date")
+            check("_version_status: installed ahead of latest is up-to-date",
+                  _version_status("0.3.0", "0.2.6") == "up-to-date")
+            check("_version_status: installed behind latest is outdated",
+                  _version_status("0.2.4", "0.2.6") == "outdated")
+            check("_version_status: strips a non-numeric tag prefix",
+                  _version_status("0.2.4", "agentic-gate--v0.2.6") == "outdated")
+            check("_version_status: unknown when nothing version-shaped",
+                  _version_status("0.2.4", "not-a-version") == "unknown")
+
+            cache_root = Path.home() / ".claude" / "plugins" / "cache"
+            check("_plugin_root_from resolves a bin/ path to its version dir",
+                  _plugin_root_from(cache_root / "mkt" / "PluginX" / "1.0" /
+                                    "bin" / "tool")
+                  == cache_root / "mkt" / "PluginX" / "1.0")
+            check("_plugin_root_from resolves a skills/ path to its version dir",
+                  _plugin_root_from(cache_root / "mkt" / "PluginX" / "1.0" /
+                                    "skills")
+                  == cache_root / "mkt" / "PluginX" / "1.0")
+            check("_plugin_root_from returns None outside the plugin cache",
+                  _plugin_root_from(Path(td) / "elsewhere" / "file") is None)
+
+            # --- audit --check-updates: enrichment with synthetic data,
+            # no real disk or network involved ---
+            installed_index = {
+                str(cache_root / "cadenceux" / "agentic-gate" / "0.2.4"): {
+                    "plugin": "agentic-gate", "marketplace": "cadenceux",
+                    "version": "0.2.4", "gitCommitSha": "abc123"},
+                str(cache_root / "fmaiac" / "FileMaker" / "0.8.16"): {
+                    "plugin": "FileMaker", "marketplace": "fmaiac",
+                    "version": "0.8.16", "gitCommitSha": None},
+            }
+            marketplaces = {
+                "cadenceux": {"source": "github", "repo": "CadenceUX/agentic-gate"},
+                "fmaiac": {"source": "directory", "path": "/some/local/path"},
+            }
+            gh_cache = {"CadenceUX/agentic-gate":
+                        {"tag": "v0.2.6", "url": "https://example.com"}}
+
+            github_loc = {"kind": "local-plugin",
+                          "detail": f"cadenceux marketplace → "
+                                    f"{cache_root / 'cadenceux' / 'agentic-gate' / '0.2.4' / 'skills'}"}
+            enriched = _enrich_with_version(github_loc, True, gh_cache,
+                                            installed_index, marketplaces)
+            check("_enrich_with_version resolves installed version for a "
+                  "github-sourced local plugin",
+                  enriched["installed_version"] == "0.2.4")
+            check("_enrich_with_version resolves the update channel as github",
+                  enriched["update_channel"] == "github")
+            check("_enrich_with_version reports outdated when latest is newer",
+                  enriched["status"] == "outdated"
+                  and enriched["latest_version"] == "v0.2.6")
+
+            directory_loc = {"kind": "local-plugin",
+                             "detail": f"fmaiac marketplace → "
+                                       f"{cache_root / 'fmaiac' / 'FileMaker' / '0.8.16' / 'skills'}"}
+            enriched2 = _enrich_with_version(directory_loc, True, gh_cache,
+                                             installed_index, marketplaces)
+            check("_enrich_with_version reports no-update-channel for a "
+                  "directory-sourced marketplace",
+                  enriched2["update_channel"] == "directory"
+                  and enriched2["status"] == "no-update-channel")
+
+            hosted_loc = {"kind": "hosted", "detail": "some account skill"}
+            enriched3 = _enrich_with_version(hosted_loc, True, gh_cache,
+                                             installed_index, marketplaces)
+            check("_enrich_with_version leaves non-plugin kinds as n/a",
+                  enriched3["update_channel"] == "n/a"
+                  and enriched3["installed_version"] is None)
+
+            empty_home = Path(td) / "no-plugins-json-here"
+            empty_home.mkdir()
+            orig_home_for_missing = Path.home
+            try:
+                Path.home = staticmethod(lambda: empty_home)
+                check("_installed_plugins_index degrades to {} when the "
+                      "file is missing", _installed_plugins_index() == {})
+                check("_known_marketplaces degrades to {} when the file "
+                      "is missing", _known_marketplaces() == {})
+            finally:
+                Path.home = orig_home_for_missing
+
+            # --- audit --check-updates: end-to-end with a fake plugin cache
+            # and a temporarily sandboxed Path.home() ---
+            fake_home = Path(td) / "fakehome"
+            fake_cache = fake_home / ".claude" / "plugins" / "cache"
+            plugin_dir = fake_cache / "mkt" / "PluginY" / "2.0"
+            (plugin_dir / "skills" / "PluginY-skill").mkdir(parents=True)
+            (plugin_dir / "bin").mkdir()
+            (plugin_dir / "bin" / "py-tool").write_text("bin")
+            plugins_meta = fake_home / ".claude" / "plugins"
+            plugins_meta.mkdir(parents=True, exist_ok=True)
+            (plugins_meta / "installed_plugins.json").write_text(json.dumps({
+                "version": 2,
+                "plugins": {"PluginY@mkt": [{
+                    "scope": "user", "installPath": str(plugin_dir),
+                    "version": "2.0"}]}}))
+            (plugins_meta / "known_marketplaces.json").write_text(json.dumps({
+                "mkt": {"source": {"source": "github", "repo": "acme/pluginy"}}}))
+
+            update_manifest = {
+                "version": 1,
+                "environments": {"env-y": {
+                    "description": "test env",
+                    "skills": ["PluginY:*"]}},
+                "shared": {},
+            }
+            orig_home = Path.home
+            orig_release = _latest_github_release
+            try:
+                Path.home = staticmethod(lambda: fake_home)
+                globals()["_latest_github_release"] = (
+                    lambda owner_repo, cache: {"tag": "v2.0", "url": "x"}
+                    if owner_repo == "acme/pluginy" else None)
+                with open(manifest_path(), "w") as f:
+                    json.dump(update_manifest, f)
+                rc_result = audit(["--check-updates"], quiet=True)
+            finally:
+                Path.home = orig_home
+                globals()["_latest_github_release"] = orig_release
+                with open(manifest_path(), "w") as f:
+                    json.dump(SELFTEST_MANIFEST, f)
+
+            check("audit --check-updates returns an inventory report",
+                  "inventory" in rc_result)
+            inv_resources = (rc_result["inventory"]["environments"]
+                             .get("env-y", {}).get("resources", []))
+            check("audit --check-updates resolves the fake plugin's "
+                  "installed version",
+                  any(r.get("installed_version") == "2.0" for r in inv_resources),
+                  f"(got {inv_resources})")
+            check("audit --check-updates matches it up-to-date against the "
+                  "stubbed latest release",
+                  any(r.get("status") == "up-to-date" for r in inv_resources),
+                  f"(got {inv_resources})")
+            check("audit --check-updates writes inventory.json",
+                  (conf_dir() / "inventory.json").exists())
+
             # --- environments: list and search ---
             listing = environments_cmd([], quiet=True)
             check("environments (no query) lists every manifest environment",
@@ -1314,6 +1714,26 @@ def selftest() -> int:
             check("switch leaves state untouched after a refusal",
                   load_state("t3").get("active") == "vendor-x")
 
+            # --- switch: session id is required, 'default' is refused ---
+            default_state_before = dict(load_state("default"))
+            rc = switch_cmd(["pack-a"], quiet=True)
+            check("switch with no session id is refused", rc == 2)
+            check("switch with no session id leaves the 'default' bucket untouched",
+                  dict(load_state("default")) == default_state_before)
+
+            rc = switch_cmd(["pack-a", "default"], quiet=True)
+            check("switch with explicit session id 'default' is refused", rc == 2)
+            check("switch to explicit 'default' leaves state untouched",
+                  dict(load_state("default")) == default_state_before)
+
+            rc = switch_cmd(["pack-a", "default", "--allow-default"], quiet=True)
+            check("switch --allow-default succeeds", rc == 0)
+            check("switch --allow-default actually writes the 'default' bucket",
+                  load_state("default").get("active") == "pack-a")
+
+            check("switch with a real session id is unaffected by the refusal logic",
+                  switch_cmd(["vendor-x", "t3"], quiet=True) == 0)
+
             # --- switch --preview: writes an HTML status page ---
             rc = switch_cmd(["pack-a", "t3", "--preview"], quiet=True)
             check("switch --preview succeeds", rc == 0)
@@ -1325,6 +1745,10 @@ def selftest() -> int:
                   "pack-a" in preview_html)
             check("switch --preview HTML shows the environment switched out of",
                   "vendor-x" in preview_html)
+            check("switch --preview HTML shows 'Now active' in the same "
+                  "Environment/Description/Declares table format as "
+                  "'Switched out of' and 'Other declared environments'",
+                  "1 skills, 1 paths" in preview_html)
             check("switch --preview HTML has no forbidden top-level tags",
                   not any(tag in preview_html.lower() for tag in
                           ("<!doctype", "<html", "<head", "<body")))

@@ -148,6 +148,24 @@ anything your manifest doesn't classify — run it after installing any new
 pack, so new toolsets get classified deliberately instead of inheriting
 access silently. Exit code 1 when unassigned items exist (CI-friendly).
 
+```bash
+python3 ~/.claude/agentic-gate/agentic-gate.py audit --check-updates
+```
+
+A separate, on-demand flag — never automatic, never part of `switch`
+(which stays instant and offline on purpose). For every *already
+classified* pattern across every environment, resolves its installed
+version (from Claude Code's own `installed_plugins.json`, no network
+needed) and, for GitHub-sourced marketplaces, checks the latest release
+via the GitHub REST API (unauthenticated, 60 req/hr, one lookup cached
+per repo per run). Writes a full report to
+`~/.claude/agentic-gate/inventory.json` — installed/latest version,
+marketplace, update channel, GitHub link, and an `up-to-date` /
+`outdated` / `no-update-channel` / `unknown` / `n/a` status per resource —
+plus a condensed stdout summary. A vendor plugin shipped through a local
+directory marketplace rather than GitHub correctly reports
+`no-update-channel`, not an error.
+
 ## Discovery and classification
 
 ```bash
@@ -170,16 +188,19 @@ manifest only ever wrote down a wildcard like `VendorX:*`, never that
 literal name.
 
 ```bash
-python3 ~/.claude/agentic-gate/agentic-gate.py switch vendor-x
 python3 ~/.claude/agentic-gate/agentic-gate.py switch vendor-x "$CLAUDE_CODE_SESSION_ID"
 python3 ~/.claude/agentic-gate/agentic-gate.py switch vendor-x "$CLAUDE_CODE_SESSION_ID" --preview
 ```
 
-`switch` manually sets the active environment for a session (defaults to
-session `default`, matching `status`'s own convention) — a third way the
-active environment changes, alongside `SessionStart`'s project-home lookup
-and `PostToolUse`'s automatic switch when a skill actually runs. Refuses
-unknown environment names and lists the real ones instead of guessing.
+`switch` manually sets the active environment for a session — a third way
+the active environment changes, alongside `SessionStart`'s project-home
+lookup and `PostToolUse`'s automatic switch when a skill actually runs.
+Refuses unknown environment names and lists the real ones instead of
+guessing. **A real session id is required.** `switch vendor-x` with
+nothing else, or `switch vendor-x default`, exits 2 rather than silently
+writing state to a `'default'` bucket no real session reads — a call that
+used to look like it worked while actually targeting nothing. Pass
+`--allow-default` if you genuinely want that bucket on purpose.
 **`$CLAUDE_CODE_SESSION_ID` is set in every Claude Code session** — use it
 to target `status`/`switch` at the actual conversation you're in, rather
 than a made-up ID: `agentic-gate.py status "$CLAUDE_CODE_SESSION_ID"` shows
